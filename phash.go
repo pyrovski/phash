@@ -43,6 +43,7 @@ type Img struct {
 func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Print(p)
+	// TODO: switch to directory walking in parallel ala https://www.oreilly.com/learning/run-strikingly-fast-parallel-file-searches-in-go-with-sync-errgroup
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
 		log.Print(err)
@@ -56,6 +57,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 	for _, f := range files {
 		fullPath := path.Join(p, f.Name())
 		matches := re.FindStringSubmatch(f.Name())
+		// TODO: support video files directly with goav
 		if matches == nil {
 			log.Printf("skipping file: %q; regex: %v", fullPath, re)
 			continue
@@ -65,7 +67,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			log.Printf("skipping file: %q; failed to parse frame: %v", fullPath, matches)
 			continue
 		}
-		// log.Printf("adding file: %q", fullPath)
+		log.Printf("adding file: %q", fullPath)
 		img := &Img{
 			path:  fullPath,
 			img:   gocv.IMRead(fullPath, gocv.IMReadGrayScale),
@@ -85,7 +87,7 @@ func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
 	defer wg.Done()
 	hasher := cv_contrib.BlockMeanHash{}
 	for img := range c {
-		//log.Printf("processing %q", img.path)
+		// log.Printf("processing %q", img.path)
 		img.hash = gocv.NewMat()
 		hasher.Compute(img.img, &img.hash)
 		img.img = gocv.NewMat()
@@ -107,14 +109,13 @@ func UnpackHash(h []byte) []uint32 {
 
 func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
-	frames := make(map[string][]*Img)
-	for img := range dbC {
-		frames[img.path] = append(frames[img.path], img)
-		// log.Print(img.path, img)
-	}
-	// log.Print(len(frames))
 
+	writeGroup := &sync.WaitGroup{}
 	commitFrames := func(imgs []*Img) error {
+		defer writeGroup.Done()
+		if len(imgs) == 0 {
+			return nil
+		}
 		tx, err := db.Begin()
 		defer tx.Rollback()
 		if err != nil {
@@ -137,6 +138,7 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 				return err
 			}
 		}
+		log.Printf("commit")
 		err = tx.Commit()
 		if err != nil {
 			log.Print(err)
@@ -145,10 +147,21 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		return nil
 	}
 
-	// TODO: these could be done in parallel
-	for _, imgs := range frames {
-		commitFrames(imgs)
+	frames := []*Img{}
+	cnt := 0
+	for img := range dbC {
+		frames = append(frames, img)
+		cnt++
+		if cnt%100 == 0 {
+			writeGroup.Add(1)
+			go commitFrames(frames)
+		}
+		// log.Print(img.path, img)
 	}
+	// log.Print(len(frames))
+	go commitFrames(frames)
+	writeGroup.Wait()
+
 	log.Print("done storing")
 }
 
@@ -171,11 +184,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	_, err = db.Query("PRAGMA synchronous = OFF")
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	go func() {
 		sigs := make(chan os.Signal, 1)
