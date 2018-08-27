@@ -40,10 +40,10 @@ type Img struct {
 
 // Get all images from a path into a stream
 // TODO: make this recursive
+// TODO: switch to directory walking in parallel ala https://www.oreilly.com/learning/run-strikingly-fast-parallel-file-searches-in-go-with-sync-errgroup
 func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Print(p)
-	// TODO: switch to directory walking in parallel ala https://www.oreilly.com/learning/run-strikingly-fast-parallel-file-searches-in-go-with-sync-errgroup
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
 		log.Print(err)
@@ -109,13 +109,14 @@ func UnpackHash(h []byte) []uint32 {
 
 func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
+	frames := make(map[string][]*Img)
+	for img := range dbC {
+		frames[img.path] = append(frames[img.path], img)
+		// log.Print(img.path, img)
+	}
+	// log.Print(len(frames))
 
-	writeGroup := &sync.WaitGroup{}
 	commitFrames := func(imgs []*Img) error {
-		defer writeGroup.Done()
-		if len(imgs) == 0 {
-			return nil
-		}
 		tx, err := db.Begin()
 		defer tx.Rollback()
 		if err != nil {
@@ -138,7 +139,6 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 				return err
 			}
 		}
-		log.Printf("commit")
 		err = tx.Commit()
 		if err != nil {
 			log.Print(err)
@@ -147,21 +147,10 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		return nil
 	}
 
-	frames := []*Img{}
-	cnt := 0
-	for img := range dbC {
-		frames = append(frames, img)
-		cnt++
-		if cnt%100 == 0 {
-			writeGroup.Add(1)
-			go commitFrames(frames)
-		}
-		// log.Print(img.path, img)
+	// TODO: these could be done in parallel
+	for _, imgs := range frames {
+		commitFrames(imgs)
 	}
-	// log.Print(len(frames))
-	go commitFrames(frames)
-	writeGroup.Wait()
-
 	log.Print("done storing")
 }
 
