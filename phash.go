@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -37,10 +38,6 @@ type Img struct {
 	key string
 }
 
-func logError(v interface{}) {
-	log.Printf("error: %v", v)
-}
-
 // Get all images from a path into a stream
 // TODO: make this recursive
 func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
@@ -48,7 +45,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 	log.Print(p)
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
-		logError(err)
+		log.Print(err)
 		return
 	}
 	if len(files) == 0 {
@@ -76,7 +73,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			key:   path.Join(p, matches[1]),
 		}
 		if img.img.Empty() {
-			logError(fmt.Sprintf("empty image: %q", fullPath))
+			log.Print(fmt.Sprintf("empty image: %q", fullPath))
 			continue
 		}
 		c <- img
@@ -119,29 +116,29 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	for _, imgs := range frames {
 		tx, err := db.Begin()
 		if err != nil {
-			logError(err)
+			log.Print(err)
 			continue
 		}
 		// TODO: this is super slow (e.g., 200 inserts in 30 seconds)
 		stmt, err := tx.Prepare(InsertHashes)
 		for _, img := range imgs {
 			if err != nil {
-				logError(err)
+				log.Print(err)
 				// TODO: put this inner loop code in a function
 				continue
 			}
 			un := UnpackHash(img.hash.ToBytes())
 			// log.Printf("adding row: %s, %d, %v, %v, %v, %v", img.key, img.frame, un[0], un[1], un[2], un[3])
 			_, err = stmt.Exec(img.key, img.frame, un[0], un[1], un[2], un[3])
-			if err != nil {
-				logError(err)
+			if err != nil && !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				log.Print(err)
 				// tx.Rollback()
 				return
 			}
 		}
 		err = tx.Commit()
 		if err != nil {
-			logError(err)
+			log.Print(err)
 			continue
 		}
 	}
