@@ -88,6 +88,7 @@ func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
 		//log.Printf("processing %q", img.path)
 		img.hash = gocv.NewMat()
 		hasher.Compute(img.img, &img.hash)
+		img.img = gocv.NewMat()
 		// block mean hash: 1x32 bytes
 		// log.Printf("%q hash: %v", img.path, img.hash.ToBytes())
 		dbC <- img
@@ -112,35 +113,41 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		// log.Print(img.path, img)
 	}
 	// log.Print(len(frames))
-	// TODO: these could be done in parallel
-	for _, imgs := range frames {
+
+	commitFrames := func(imgs []*Img) error {
 		tx, err := db.Begin()
+		defer tx.Rollback()
 		if err != nil {
 			log.Print(err)
-			continue
+			return err
 		}
-		// TODO: this is super slow (e.g., 200 inserts in 30 seconds)
 		stmt, err := tx.Prepare(InsertHashes)
+		if err != nil {
+			log.Print(err)
+			return err
+		}
+		// TODO: this is super slow on LizardFS
 		for _, img := range imgs {
-			if err != nil {
-				log.Print(err)
-				// TODO: put this inner loop code in a function
-				continue
-			}
+			// TODO: put this inner loop code in a function
 			un := UnpackHash(img.hash.ToBytes())
 			// log.Printf("adding row: %s, %d, %v, %v, %v, %v", img.key, img.frame, un[0], un[1], un[2], un[3])
 			_, err = stmt.Exec(img.key, img.frame, un[0], un[1], un[2], un[3])
 			if err != nil && !strings.Contains(err.Error(), "UNIQUE constraint failed") {
 				log.Print(err)
-				// tx.Rollback()
-				return
+				return err
 			}
 		}
 		err = tx.Commit()
 		if err != nil {
 			log.Print(err)
-			continue
+			return err
 		}
+		return nil
+	}
+
+	// TODO: these could be done in parallel
+	for _, imgs := range frames {
+		commitFrames(imgs)
 	}
 	log.Print("done storing")
 }
@@ -164,6 +171,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	_, err = db.Query("PRAGMA synchronous = OFF")
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	go func() {
 		sigs := make(chan os.Signal, 1)
