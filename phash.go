@@ -1,7 +1,6 @@
 package main
 
 import (
-	//	"context"
 	"bytes"
 	"database/sql"
 	"encoding/binary"
@@ -43,7 +42,7 @@ type Img struct {
 // TODO: switch to directory walking in parallel ala https://www.oreilly.com/learning/run-strikingly-fast-parallel-file-searches-in-go-with-sync-errgroup
 func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Print(p)
+	// log.Print(p)
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
 		log.Print(err)
@@ -58,8 +57,9 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		fullPath := path.Join(p, f.Name())
 		matches := re.FindStringSubmatch(f.Name())
 		// TODO: support video files directly with goav
+		// TODO: support tar files of imagesz
 		if matches == nil {
-			log.Printf("skipping file: %q; regex: %v", fullPath, re)
+			// log.Printf("skipping file: %q; regex: %v", fullPath, re)
 			continue
 		}
 		frame, err := strconv.Atoi(matches[2])
@@ -80,7 +80,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		}
 		c <- img
 	}
-	log.Print("done reading")
+	// log.Print("done reading")
 }
 
 func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
@@ -90,12 +90,12 @@ func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
 		// log.Printf("processing %q", img.path)
 		img.hash = gocv.NewMat()
 		hasher.Compute(img.img, &img.hash)
-		img.img = gocv.NewMat()
+		img.img.Close()
 		// block mean hash: 1x32 bytes
 		// log.Printf("%q hash: %v", img.path, img.hash.ToBytes())
 		dbC <- img
 	}
-	log.Print("done processing")
+	// log.Print("done processing")
 }
 
 func UnpackHash(h []byte) []uint32 {
@@ -109,14 +109,8 @@ func UnpackHash(h []byte) []uint32 {
 
 func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
-	frames := make(map[string][]*Img)
-	for img := range dbC {
-		frames[img.path] = append(frames[img.path], img)
-		// log.Print(img.path, img)
-	}
-	// log.Print(len(frames))
-
 	commitFrames := func(imgs []*Img) error {
+		defer wg.Done()
 		tx, err := db.Begin()
 		defer tx.Rollback()
 		if err != nil {
@@ -130,9 +124,13 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		}
 		// TODO: this is super slow on LizardFS
 		for _, img := range imgs {
+			if img == nil {
+				return nil
+			}
 			// TODO: put this inner loop code in a function
 			un := UnpackHash(img.hash.ToBytes())
-			// log.Printf("adding row: %s, %d, %v, %v, %v, %v", img.key, img.frame, un[0], un[1], un[2], un[3])
+			img.hash.Close()
+			log.Print(img.key, img.frame)
 			_, err = stmt.Exec(img.key, img.frame, un[0], un[1], un[2], un[3])
 			if err != nil && !strings.Contains(err.Error(), "UNIQUE constraint failed") {
 				log.Print(err)
@@ -147,11 +145,22 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		return nil
 	}
 
-	// TODO: these could be done in parallel
-	for _, imgs := range frames {
-		commitFrames(imgs)
+	count := 0
+	batch := 100
+	imgs := make([]*Img, 0, batch)
+	for img := range dbC {
+		imgs = append(imgs, img)
+		if count%batch == 0 {
+			log.Print("commit")
+			wg.Add(1)
+			go commitFrames(imgs)
+			imgs = make([]*Img, 0, batch)
+		}
+		count++
 	}
-	log.Print("done storing")
+	wg.Add(1)
+	commitFrames(imgs)
+	// log.Print("done storing")
 }
 
 func main() {
