@@ -27,6 +27,7 @@ const InsertHashes = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) va
 
 var procs int
 var dbFile string
+var keyFile string
 
 type Img struct {
 	path  string
@@ -52,6 +53,21 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		log.Printf("no files in %q", p)
 		return
 	}
+	var fileKey string
+	if keyFile != "" {
+		fullKeyFile := path.Join(p, keyFile)
+		log.Printf("reading key from %q", fullKeyFile)
+		b, err := ioutil.ReadFile(fullKeyFile)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		fileKey = string(b)
+		if fileKey == "" {
+			log.Print("expected nonempty key")
+			return
+		}
+	}
 	re := regexp.MustCompile("(.*)-([0-9]+)[.]jpg")
 	for _, f := range files {
 		fullPath := path.Join(p, f.Name())
@@ -72,7 +88,12 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			path:  fullPath,
 			img:   gocv.IMRead(fullPath, gocv.IMReadGrayScale),
 			frame: frame,
-			key:   path.Join(p, matches[1]),
+		}
+		if keyFile != "" {
+			img.key = fileKey
+		} else {
+			img.key = path.Join(p, matches[1])
+
 		}
 		if img.img.Empty() {
 			log.Print(fmt.Sprintf("empty image: %q", fullPath))
@@ -170,6 +191,7 @@ func main() {
 	}
 	flag.IntVar(&procs, "procs", 1, "# of goroutines for processing hashes")
 	flag.StringVar(&dbFile, "db", "", "sqlite3 DB file")
+	flag.StringVar(&keyFile, "keyfile", "", "read each directory's key from this filename in the directory")
 	flag.Parse()
 	args = flag.Args()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
