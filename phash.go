@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // CREATE TABLE key_hashes(fullpath text, mtime text, frame integer, h1 bigint, h2 bigint, h3 bigint, h4 bigint);
@@ -28,8 +29,10 @@ const InsertHashes = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) va
 var procs int
 var dbFile string
 var keyFile string
+var dbTimeout time.Duration
 
 type Img struct {
+	// full image path
 	path  string
 	img   gocv.Mat
 	frame int
@@ -68,6 +71,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			return
 		}
 	}
+	// TODO: get a hash of the file header, add to struct
 	re := regexp.MustCompile("(.*)-([0-9]+)[.]jpg")
 	for _, f := range files {
 		fullPath := path.Join(p, f.Name())
@@ -143,7 +147,6 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 			log.Print(err)
 			return err
 		}
-		// TODO: this is super slow on LizardFS
 		for _, img := range imgs {
 			if img == nil {
 				return nil
@@ -151,7 +154,7 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 			// TODO: put this inner loop code in a function
 			un := UnpackHash(img.hash.ToBytes())
 			img.hash.Close()
-			log.Print(img.key, img.frame)
+			log.Print(img.key, " ", img.frame)
 			_, err = stmt.Exec(img.key, img.frame, un[0], un[1], un[2], un[3])
 			if err != nil && !strings.Contains(err.Error(), "UNIQUE constraint failed") {
 				log.Print(err)
@@ -166,6 +169,19 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		return nil
 	}
 
+	retry := func(f func() error, timeout time.Duration) error {
+		start := time.Now()
+		var err error = nil
+		for ok := true; ok; ok = time.Now().Before(start.Add(timeout)) {
+			err = f()
+			if err == nil ||
+				!strings.Contains(err.Error(), "database is locked") {
+				return err
+			}
+		}
+		return err
+	}
+
 	count := 0
 	batch := 100
 	imgs := make([]*Img, 0, batch)
@@ -174,13 +190,13 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		if count%batch == 0 {
 			log.Print("commit")
 			wg.Add(1)
-			go commitFrames(imgs)
+			go retry(func() error { return commitFrames(imgs) }, dbTimeout)
 			imgs = make([]*Img, 0, batch)
 		}
 		count++
 	}
 	wg.Add(1)
-	commitFrames(imgs)
+	go retry(func() error { return commitFrames(imgs) }, dbTimeout)
 	// log.Print("done storing")
 }
 
@@ -192,6 +208,7 @@ func main() {
 	flag.IntVar(&procs, "procs", 1, "# of goroutines for processing hashes")
 	flag.StringVar(&dbFile, "db", "", "sqlite3 DB file")
 	flag.StringVar(&keyFile, "keyfile", "", "read each directory's key from this filename in the directory")
+	flag.DurationVar(&dbTimeout, "dbtimeout", time.Duration(30), "timeout for DB operations")
 	flag.Parse()
 	args = flag.Args()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
