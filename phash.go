@@ -24,12 +24,14 @@ import (
 )
 
 // CREATE TABLE key_hashes(fullpath text, mtime text, frame integer, h1 bigint, h2 bigint, h3 bigint, h4 bigint);
-const InsertHashes = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) values(?,?,?,?,?,?)"
+const InsertHashesQuery = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) values(?,?,?,?,?,?)"
+const LookupHashesQuery = "select fullpath, frame from key_hashes where h1 = ? and h2 = ? and h3 = ? and h4 = ?"
 
 var procs int
 var dbFile string
 var keyFile string
 var dbTimeout time.Duration
+var query bool
 
 type Img struct {
 	// full image path
@@ -87,7 +89,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			log.Printf("skipping file: %q; failed to parse frame: %v", fullPath, matches)
 			continue
 		}
-		log.Printf("adding file: %q", fullPath)
+		log.Printf("reading file: %q", fullPath)
 		img := &Img{
 			path:  fullPath,
 			img:   gocv.IMRead(fullPath, gocv.IMReadGrayScale),
@@ -142,7 +144,7 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 			log.Print(err)
 			return err
 		}
-		stmt, err := tx.Prepare(InsertHashes)
+		stmt, err := tx.Prepare(InsertHashesQuery)
 		if err != nil {
 			log.Print(err)
 			return err
@@ -202,6 +204,46 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	// log.Print("done storing")
 }
 
+func LookupHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	stmt, err := db.Prepare(LookupHashesQuery)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	lookupHash := func(img *Img) {
+		defer wg.Done()
+		un := UnpackHash(img.hash.ToBytes())
+		rows, err := stmt.Query(un[0], un[1], un[2], un[3])
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		defer rows.Close()
+		paths := make([]string, 0)
+		frames := make([]int, 0)
+		for rows.Next() {
+			var filepath string
+			var frame int
+			if err := rows.Scan(&filepath, &frame); err != nil {
+				log.Fatal(err)
+			}
+			paths = append(paths, filepath)
+			frames = append(frames, frame)
+		}
+		if err := rows.Err(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%v:%v:%v:%v\n", img.path, un, paths, frames)
+	}
+
+	for img := range dbC {
+		wg.Add(1)
+		go lookupHash(img)
+	}
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) < 1 {
@@ -211,6 +253,7 @@ func main() {
 	flag.StringVar(&dbFile, "db", "", "sqlite3 DB file")
 	flag.StringVar(&keyFile, "keyfile", "", "read each directory's key from this filename in the directory")
 	flag.DurationVar(&dbTimeout, "dbtimeout", time.Duration(30), "timeout for DB operations")
+	flag.BoolVar(&query, "query", false, "query DB for input matches if true; otherwise, add entries to DB")
 	flag.Parse()
 	args = flag.Args()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -249,7 +292,11 @@ func main() {
 		go GetImages(p, c, rg)
 	}
 	dg.Add(1)
-	go StoreHashes(dbC, db, dg)
+	if query {
+		go LookupHashes(dbC, db, dg)
+	} else {
+		go StoreHashes(dbC, db, dg)
+	}
 	rg.Wait()
 	close(c)
 	pg.Wait()
