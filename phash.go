@@ -190,7 +190,9 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 		if count%batch == 0 {
 			log.Print("commit")
 			wg.Add(1)
-			go retry(func() error { return commitFrames(imgs) }, dbTimeout)
+			imgsCopy := make([]*Img, len(imgs))
+			copy(imgsCopy, imgs)
+			go retry(func() error { return commitFrames(imgsCopy) }, dbTimeout)
 			imgs = make([]*Img, 0, batch)
 		}
 		count++
