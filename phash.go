@@ -1,39 +1,39 @@
-package main
+package phash
+
+// TODO: add tests
 
 import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
-	"flag"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"gocv.io/x/gocv"
-	cv_contrib "gocv.io/x/gocv/contrib"
 	"io/ioutil"
 	"log"
-	"os"
-	"os/signal"
 	"path"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"gocv.io/x/gocv"
+	cv_contrib "gocv.io/x/gocv/contrib"
 )
 
+type PHasher struct {
+	DBFile    string
+	DBTimeout time.Duration
+	KeyFile   string // key filename for directories of images
+	HashProcs int
+}
+
+// insertHashesQuery is used to insert hashes into the 'key_hashes' table.
 // CREATE TABLE key_hashes(fullpath text, mtime text, frame integer, h1 bigint, h2 bigint, h3 bigint, h4 bigint);
-const InsertHashesQuery = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) values(?,?,?,?,?,?)"
-const LookupHashesQuery = "select fullpath, frame from key_hashes where h1 = ? and h2 = ? and h3 = ? and h4 = ?"
+const insertHashesQuery = "INSERT INTO key_hashes(fullpath, frame, h1, h2, h3, h4) values(?,?,?,?,?,?)"
+const lookupHashesQuery = "select fullpath, frame from key_hashes where h1 = ? and h2 = ? and h3 = ? and h4 = ?"
 
-var procs int
-var dbFile string
-var keyFile string
-var dbTimeout time.Duration
-var query bool
-
-type Img struct {
+type image struct {
 	// full image path
 	path  string
 	img   gocv.Mat
@@ -43,12 +43,12 @@ type Img struct {
 	key string
 }
 
-// Get all images from a path into a stream
+// getImages gets all images from a path into a stream
 // TODO: make this recursive
 // TODO: switch to directory walking in parallel ala https://www.oreilly.com/learning/run-strikingly-fast-parallel-file-searches-in-go-with-sync-errgroup
-func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
+// TODO: pass flag value as argument
+func (h *PHasher) getImages(p string, c chan *image, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// log.Print(p)
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
 		log.Print(err)
@@ -59,8 +59,8 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		return
 	}
 	var fileKey string
-	if keyFile != "" {
-		fullKeyFile := path.Join(p, keyFile)
+	if h.KeyFile != "" {
+		fullKeyFile := path.Join(p, h.KeyFile)
 		log.Printf("reading key from %q", fullKeyFile)
 		b, err := ioutil.ReadFile(fullKeyFile)
 		if err != nil {
@@ -79,7 +79,7 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		fullPath := path.Join(p, f.Name())
 		matches := re.FindStringSubmatch(f.Name())
 		// TODO: support video files directly with goav
-		// TODO: support tar files of imagesz
+		// TODO: support tar files of images
 		if matches == nil {
 			// log.Printf("skipping file: %q; regex: %v", fullPath, re)
 			continue
@@ -90,16 +90,15 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 			continue
 		}
 		log.Printf("reading file: %q", fullPath)
-		img := &Img{
+		img := &image{
 			path:  fullPath,
 			img:   gocv.IMRead(fullPath, gocv.IMReadGrayScale),
 			frame: frame,
 		}
-		if keyFile != "" {
+		if h.KeyFile != "" {
 			img.key = fileKey
 		} else {
 			img.key = path.Join(p, matches[1])
-
 		}
 		if img.img.Empty() {
 			log.Print(fmt.Sprintf("empty image: %q", fullPath))
@@ -107,14 +106,14 @@ func GetImages(p string, c chan *Img, wg *sync.WaitGroup) {
 		}
 		c <- img
 	}
-	// log.Print("done reading")
 }
 
-func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
+// processImages reads images from 'c', adds perceptual hashes, and writes the
+// results to 'dbC'.
+func processImages(c chan *image, wg *sync.WaitGroup, dbC chan *image) {
 	defer wg.Done()
 	hasher := cv_contrib.BlockMeanHash{}
 	for img := range c {
-		// log.Printf("processing %q", img.path)
 		img.hash = gocv.NewMat()
 		hasher.Compute(img.img, &img.hash)
 		img.img.Close()
@@ -122,10 +121,10 @@ func ProcessImages(c chan *Img, wg *sync.WaitGroup, dbC chan *Img) {
 		// log.Printf("%q hash: %v", img.path, img.hash.ToBytes())
 		dbC <- img
 	}
-	// log.Print("done processing")
 }
 
-func UnpackHash(h []byte) []uint32 {
+// unpackHash converts a 32-byte hash from byte slice to a uint32 array
+func unpackHash(h []byte) []uint32 {
 	result := make([]uint32, 4)
 	buf := bytes.NewBuffer(h)
 	for i := 0; i < 4; i++ {
@@ -134,9 +133,10 @@ func UnpackHash(h []byte) []uint32 {
 	return result
 }
 
-func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
+// storeHashes reads images over 'dbC' and stores their hashes to 'db'.
+func (h *PHasher) storeHashes(dbC chan *image, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
-	commitFrames := func(imgs []*Img) error {
+	commitFrames := func(imgs []*image) error {
 		defer wg.Done()
 		tx, err := db.Begin()
 		defer tx.Rollback()
@@ -144,7 +144,7 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 			log.Print(err)
 			return err
 		}
-		stmt, err := tx.Prepare(InsertHashesQuery)
+		stmt, err := tx.Prepare(insertHashesQuery)
 		if err != nil {
 			log.Print(err)
 			return err
@@ -154,7 +154,7 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 				return nil
 			}
 			// TODO: put this inner loop code in a function
-			un := UnpackHash(img.hash.ToBytes())
+			un := unpackHash(img.hash.ToBytes())
 			img.hash.Close()
 			log.Print(img.key, " ", img.frame)
 			_, err = stmt.Exec(img.key, img.frame, un[0], un[1], un[2], un[3])
@@ -186,35 +186,45 @@ func StoreHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 
 	count := 0
 	batch := 100
-	imgs := make([]*Img, 0, batch)
+	imgs := make([]*image, 0, batch)
 	for img := range dbC {
 		imgs = append(imgs, img)
 		if count%batch == 0 {
 			log.Print("commit")
 			wg.Add(1)
-			imgsCopy := make([]*Img, len(imgs))
+			imgsCopy := make([]*image, len(imgs))
 			copy(imgsCopy, imgs)
-			go retry(func() error { return commitFrames(imgsCopy) }, dbTimeout)
-			imgs = make([]*Img, 0, batch)
+			go retry(func() error { return commitFrames(imgsCopy) }, h.DBTimeout)
+			imgs = make([]*image, 0, batch)
 		}
 		count++
 	}
 	wg.Add(1)
-	go retry(func() error { return commitFrames(imgs) }, dbTimeout)
+	go retry(func() error { return commitFrames(imgs) }, h.DBTimeout)
 	// log.Print("done storing")
 }
 
-func LookupHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
+// printHashes prints hashes from images in 'dbC'.
+func printHashes(dbC chan *image, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for img := range dbC {
+		un := unpackHash(img.hash.ToBytes())
+		fmt.Printf("%v\t%v\n", img.path, un)
+	}
+}
+
+// lookupHashes looks up hashes from images in 'dbC' in 'db' and prints the results.
+func lookupHashes(dbC chan *image, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	stmt, err := db.Prepare(LookupHashesQuery)
+	stmt, err := db.Prepare(lookupHashesQuery)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	lookupHash := func(img *Img) {
+	lookupHash := func(img *image) {
 		defer wg.Done()
-		un := UnpackHash(img.hash.ToBytes())
+		un := unpackHash(img.hash.ToBytes())
 		rows, err := stmt.Query(un[0], un[1], un[2], un[3])
 		if err != nil {
 			log.Print(err)
@@ -244,58 +254,49 @@ func LookupHashes(dbC chan *Img, db *sql.DB, wg *sync.WaitGroup) {
 	}
 }
 
-func main() {
-	args := os.Args[1:]
-	if len(args) < 1 {
-		log.Fatalf("must provide one or more path arguments")
-	}
-	flag.IntVar(&procs, "procs", 1, "# of goroutines for processing hashes")
-	flag.StringVar(&dbFile, "db", "", "sqlite3 DB file")
-	flag.StringVar(&keyFile, "keyfile", "", "read each directory's key from this filename in the directory")
-	flag.DurationVar(&dbTimeout, "dbtimeout", time.Duration(30), "timeout for DB operations")
-	flag.BoolVar(&query, "query", false, "query DB for input matches if true; otherwise, add entries to DB")
-	flag.Parse()
-	args = flag.Args()
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+type mode int
 
-	if dbFile == "" {
-		log.Fatalf("must set --db")
-	}
-	db, err := sql.Open("sqlite3", dbFile)
+const (
+	query mode = 0
+	store mode = 1
+	show  mode = 2
+)
+
+func (h *PHasher) LookupHashesInDirs(paths []string)  { h.pipeline(paths, query) }
+func (h *PHasher) StoreHashesFromDirs(paths []string) { h.pipeline(paths, store) }
+func (h *PHasher) PrintHashesInDirs(paths []string)   { h.pipeline(paths, show) }
+
+func (h *PHasher) pipeline(paths []string, m mode) {
+	db, err := sql.Open("sqlite3", h.DBFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	go func() {
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGQUIT)
-		buf := make([]byte, 1<<20)
-		for {
-			<-sigs
-			stacklen := runtime.Stack(buf, true)
-			log.Printf("=== received SIGQUIT ===\n*** goroutine dump...\n%s\n*** end\n", buf[:stacklen])
-		}
-	}()
-
-	c := make(chan *Img)
-	dbC := make(chan *Img)
+	c := make(chan *image)
+	dbC := make(chan *image)
 	pg := &sync.WaitGroup{}
 	rg := &sync.WaitGroup{}
 	dg := &sync.WaitGroup{}
-	for i := 0; i < procs; i++ {
-		pg.Add(1)
-		go ProcessImages(c, pg, dbC)
+	if h.HashProcs <= 0 {
+		h.HashProcs = runtime.NumCPU()
 	}
-	for _, p := range args {
+	for i := 0; i < h.HashProcs; i++ {
+		pg.Add(1)
+		go processImages(c, pg, dbC)
+	}
+	for _, p := range paths {
 		rg.Add(1)
-		go GetImages(p, c, rg)
+		go h.getImages(p, c, rg)
 	}
 	dg.Add(1)
-	if query {
-		go LookupHashes(dbC, db, dg)
-	} else {
-		go StoreHashes(dbC, db, dg)
+	switch m {
+	case query:
+		go lookupHashes(dbC, db, dg)
+	case store:
+		go h.storeHashes(dbC, db, dg)
+	case show:
+		go printHashes(dbC, dg)
 	}
 	rg.Wait()
 	close(c)
